@@ -25,8 +25,13 @@ Two-factor authentication code copier for MacOS.
 1. `./install.sh`
 
 ## Debugging
-Restart launchd service
+Restart launchd service:
+
 `launchctl kickstart -k gui/$(id -u)/com.louiekotler.2FA-code-catcher`
+
+Check if launchd service is running:
+
+`launchctl list | grep com.louiekotler.2FA-code-catcher`
 
 ## Uninstall
 1. `cd scripts`
