@@ -1,4 +1,3 @@
-
 #!/bin/bash
 
 set -e  # stop on first error
@@ -11,10 +10,17 @@ PLIST_DEST="$HOME/Library/LaunchAgents/${PLIST_NAME}"
 
 echo "Installing ${APP_NAME}..."
 
-# 1. Unload if already loaded (ignore errors)
+# Unload if already loaded (ignore errors)
 launchctl unload "${PLIST_DEST}" 2>/dev/null || true
 
-# 2. Copy the executable
+# Ensure /usr/local/bin exists
+if [ ! -d /usr/local/bin ]; then
+    echo "Creating /usr/local/bin..."
+    sudo mkdir -p /usr/local/bin
+    sudo chmod 755 /usr/local/bin
+fi
+
+# Copy the executable
 if [ ! -f "../dist/${APP_NAME}" ]; then
     echo "❌ Executable not found at ../dist/${APP_NAME}"
     exit 1
@@ -24,7 +30,7 @@ echo "Copying executable to ${EXECUTABLE_PATH}..."
 sudo cp "../dist/${APP_NAME}" "${EXECUTABLE_PATH}"
 sudo chmod 755 "${EXECUTABLE_PATH}"
 
-# 3. Copy the LaunchAgent plist
+# Copy the LaunchAgent plist
 if [ ! -f "../launchd/${PLIST_NAME}" ]; then
     echo "❌ Plist not found at ../launchd/${PLIST_NAME}"
     exit 1
@@ -34,7 +40,7 @@ echo "Copying LaunchAgent to ${PLIST_DEST}..."
 cp "../launchd/${PLIST_NAME}" "${PLIST_DEST}"
 chmod 644 "${PLIST_DEST}"
 
-# 4. Load the plist under the current user
+# Load the plist under the current user
 echo "Loading LaunchAgent..."
 launchctl load "${PLIST_DEST}"
 
