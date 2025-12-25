@@ -1,67 +1,80 @@
 #!/usr/bin/env python3
+
 import logging
 import re
+import signal
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pyperclip
-from watchdog.events import FileSystemEventHandler
-from watchdog.observers import Observer
 
 DB_PATH = Path.home() / "Library/Messages/chat.db"
-NICKNAME_CACHE_DIR = Path.home() / "Library/Messages/NickNameCache"
 MAC_EPOCH = datetime(2001, 1, 1)
 
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger("2FA-code-catcher")
-
-handler = logging.StreamHandler(sys.stdout)
-formatter = logging.Formatter(
-    fmt="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+LOG_PREDICATE = (
+    'process == "imagent" AND ' 'eventMessage CONTAINS "SMSReceivedRelayMessage"'
 )
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+
+LOG_CMD = [
+    "log",
+    "stream",
+    "--style",
+    "syslog",
+    "--predicate",
+    LOG_PREDICATE,
+    "--line-buffered",
+]
+
+CODE_REGEX = re.compile(r"\b\d{4,8}\b")
+KEYWORD_REGEX = re.compile(r"PIN|code", re.IGNORECASE)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("2FA-code-catcher")
 
 
 def apple_time_to_dt(ts: float) -> datetime:
-    """
-    Convert Apple epoch time to Python datetime.
-    Handles both nanoseconds and seconds.
-    """
+    """Convert Apple epoch timestamp to datetime."""
     if ts > 1e12:
-        ts /= 1e9  # Convert nanoseconds to seconds
+        ts /= 1e9
     return MAC_EPOCH + timedelta(seconds=ts)
 
 
-def get_latest_message_from_them(retries=5, delay=2.0):
-    for attempt in range(retries):
+def get_latest_message_from_them(retry_limit: int | None = 5, delay: float = 1.0):
+    attempt = 0
+    while retry_limit is None or attempt < retry_limit:
+        attempt += 1
         try:
             with sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True) as conn:
                 conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-                cursor.execute(
+                row = conn.execute(
                     """
                     SELECT ROWID, text, handle_id, is_from_me, date
                     FROM message
                     WHERE is_from_me = 0
                     ORDER BY ROWID DESC
-                    LIMIT 1;
+                    LIMIT 1
                     """
-                )
-                row = cursor.fetchone()
-                if row:
-                    timestamp = apple_time_to_dt(row["date"])
-                    return {
-                        "rowid": row["ROWID"],
-                        "text": row["text"] or "",
-                        "sender_type": "Them",
-                        "handle_id": row["handle_id"],
-                        "timestamp": timestamp,
-                    }
-                return None
+                ).fetchone()
+
+                if not row:
+                    return None
+
+                return {
+                    "rowid": row["ROWID"],
+                    "text": row["text"] or "",
+                    "sender_type": "Them",
+                    "handle_id": row["handle_id"],
+                    "timestamp": apple_time_to_dt(row["date"]),
+                }
+
         except sqlite3.OperationalError as e:
             msg = str(e).lower()
             if "locked" in msg or "busy" in msg:
@@ -85,44 +98,72 @@ def get_latest_message_from_them(retries=5, delay=2.0):
     return None
 
 
-class MessageWatcher(FileSystemEventHandler):
-    def __init__(self):
-        self.last_rowid = None
+def process_message(msg: dict):
+    """Extract 2FA codes and copy to clipboard."""
+    text = msg["text"]
 
-    def on_modified(self, event):
-        # Trigger on NickNameCache database files which seem to be the most reliable indicator of a new message
-        # Note: The chat.db and chat.db-wal do not seem to written to directly upon arrival of a new message
-        if event.src_path.endswith((".db", ".db-wal", ".db-shm")):
-            self.check_new_message()
+    if not KEYWORD_REGEX.search(text):
+        return
 
-    def check_new_message(self):
-        msg = get_latest_message_from_them()
-        if msg and msg["rowid"] != self.last_rowid:
-            self.last_rowid = msg["rowid"]
-            # Check for PIN/code and copy to clipboard
-            if re.search(r"PIN|code", msg["text"], re.IGNORECASE):
-                logger.info(f"[{msg['timestamp']}] {msg['sender_type']}: {msg['text']}")
-                match = re.search(r"\b\d{4,8}\b", msg["text"])
-                if match:
-                    code = match.group()
-                    pyperclip.copy(code)
-                    logger.info(f"Copied code to clipboard: {code}")
+    match = CODE_REGEX.search(text)
+    if not match:
+        return
+
+    code = match.group()
+    pyperclip.copy(code)
+
+    logger.info(
+        "2FA code detected [%s]: %s",
+        msg["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
+        code,
+    )
 
 
 def main():
-    event_handler = MessageWatcher()
-    observer = Observer()
+    logger.info("Listening for Messages events (event-based)")
+    logger.info("Press Ctrl+C to exit")
 
-    observer.schedule(event_handler, str(NICKNAME_CACHE_DIR), recursive=False)
-    observer.start()
-    logger.info("Watching for new messages... (Ctrl+C to stop)")
+    # Initialize with current latest message to avoid reprocessing old messages
+    # Use infinite retries on startup because this is required to continue
+    initial_msg = get_latest_message_from_them(retry_limit=None)
+    # Shift initial last_rowid back by one to force the first read on startup to be seen as a fresh message
+    last_rowid = initial_msg["rowid"] - 1 if initial_msg else 0
+    logger.info("Successfully read from Messages database")
 
-    try:
-        observer.join()
-    except KeyboardInterrupt:
-        observer.stop()
-        logger.info("\nStopped watching.")
-    observer.join()
+    proc = subprocess.Popen(
+        LOG_CMD,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+
+    def shutdown(_sig, _frame):
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    for line in proc.stdout:
+        # Ignore log stream headers
+        if "SMSReceivedRelayMessage" not in line:
+            continue
+
+        msg = get_latest_message_from_them()
+
+        # Retry until receive fresh message
+        while not msg or msg["rowid"] <= last_rowid:
+            logger.info("Waiting for fresh message in database")
+            time.sleep(0.1)
+            msg = get_latest_message_from_them()
+
+        last_rowid = msg["rowid"]
+        process_message(msg)
 
 
 if __name__ == "__main__":
